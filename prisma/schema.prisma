@@ -1,0 +1,338 @@
+// ==========================================================
+// Roadside Assistance & Garage Discovery Platform
+// Prisma Schema — derived from Engineering Spec v1.0.0-PROD
+// ==========================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// -----------------------------
+// ENUMS
+// -----------------------------
+
+enum UserRole {
+  CUSTOMER
+  GARAGE_OWNER
+  MECHANIC
+  ADMIN
+}
+
+enum GarageWorkerStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  REMOVED
+}
+
+enum WorkerAvailability {
+  AVAILABLE
+  BUSY
+  OFFLINE
+}
+
+enum ServiceRequestStatus {
+  PENDING
+  ACCEPTED
+  MECHANIC_ASSIGNED
+  ON_THE_WAY
+  ARRIVED
+  IN_SERVICE
+  COMPLETED
+  PAYMENT_PENDING
+  PAID
+  REVIEWED
+  CANCELLED
+  REJECTED
+}
+
+enum AssignmentStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum OtpPurpose {
+  ARRIVAL
+  PAYMENT
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum ReviewTargetType {
+  GARAGE
+  MECHANIC
+}
+
+// -----------------------------
+// CORE IDENTITY
+// -----------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  phone        String?
+  role         UserRole
+  isSuspended  Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Relations by role
+  ownedGarages     Garage[]        @relation("GarageOwner")
+  garageWorker     GarageWorker?
+  vehicles         Vehicle[]
+  serviceRequests  ServiceRequest[] @relation("CustomerRequests")
+  reviewsWritten   Review[]        @relation("ReviewAuthor")
+  auditLogs        AuditLog[]      @relation("AuditActor")
+
+  @@index([role])
+  @@map("users")
+}
+
+// -----------------------------
+// GARAGE & WORKFORCE
+// -----------------------------
+
+model Garage {
+  id          String   @id @default(cuid())
+  ownerId     String
+  owner       User     @relation("GarageOwner", fields: [ownerId], references: [id])
+  name        String
+  address     String
+  latitude    Float
+  longitude   Float
+  isOpen      Boolean  @default(true)
+  rating      Float    @default(0)
+  reviewCount Int      @default(0)
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workers         GarageWorker[]
+  serviceRequests ServiceRequest[]
+
+  @@index([ownerId])
+  @@index([latitude, longitude])
+  @@map("garages")
+}
+
+model GarageWorker {
+  id           String             @id @default(cuid())
+  garageId     String
+  garage       Garage             @relation(fields: [garageId], references: [id])
+  userId       String             @unique
+  user         User               @relation(fields: [userId], references: [id])
+  status       GarageWorkerStatus @default(PENDING)
+  availability WorkerAvailability @default(OFFLINE)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  assignments Assignment[]
+
+  @@index([garageId])
+  @@index([status, availability])
+  @@map("garage_workers")
+}
+
+// -----------------------------
+// VEHICLES
+// -----------------------------
+
+model Vehicle {
+  id                 String   @id @default(cuid())
+  customerId         String
+  customer           User     @relation(fields: [customerId], references: [id])
+  brand              String
+  model              String
+  year               Int
+  registrationNumber String   @unique
+  vehicleType        String
+  color              String?
+  createdAt          DateTime @default(now())
+
+  serviceRequests ServiceRequest[]
+
+  @@index([customerId])
+  @@map("vehicles")
+}
+
+// -----------------------------
+// SERVICE REQUEST (core workflow entity)
+// -----------------------------
+
+model ServiceRequest {
+  id                 String                @id @default(cuid())
+  customerId         String
+  customer           User                  @relation("CustomerRequests", fields: [customerId], references: [id])
+  garageId           String
+  garage             Garage                @relation(fields: [garageId], references: [id])
+  vehicleId          String
+  vehicle            Vehicle               @relation(fields: [vehicleId], references: [id])
+
+  status             ServiceRequestStatus  @default(PENDING)
+  problemCategory    String
+  problemDescription String
+  customerLat        Float
+  customerLng        Float
+
+  // Server-authoritative pricing, set only by backend on completion
+  finalPrice         Decimal?              @db.Decimal(10, 2)
+
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  acceptedAt         DateTime?
+  assignedAt         DateTime?
+  arrivedAt          DateTime?
+  completedAt        DateTime?
+  cancelledAt        DateTime?
+
+  images             ServiceRequestImage[]
+  assignment         Assignment?
+  arrivalVerification ArrivalVerification?
+  paymentVerification PaymentVerification?
+  payment            Payment?
+  reviews            Review[]
+  auditLogs          AuditLog[]
+
+  @@index([customerId])
+  @@index([garageId])
+  @@index([status])
+  @@map("service_requests")
+}
+
+model ServiceRequestImage {
+  id               String         @id @default(cuid())
+  serviceRequestId String
+  serviceRequest   ServiceRequest @relation(fields: [serviceRequestId], references: [id])
+  imageUrl         String
+  createdAt        DateTime       @default(now())
+
+  @@index([serviceRequestId])
+  @@map("service_request_images")
+}
+
+// -----------------------------
+// ASSIGNMENT (one active assignment per request, enforced by unique constraint)
+// -----------------------------
+
+model Assignment {
+  id               String           @id @default(cuid())
+  serviceRequestId String           @unique
+  serviceRequest   ServiceRequest   @relation(fields: [serviceRequestId], references: [id])
+  workerId         String
+  worker           GarageWorker     @relation(fields: [workerId], references: [id])
+  status           AssignmentStatus @default(ACTIVE)
+  assignedAt       DateTime         @default(now())
+  completedAt      DateTime?
+
+  @@index([workerId])
+  @@map("assignments")
+}
+
+// -----------------------------
+// OTP VERIFICATION (arrival + payment share the same shape)
+// -----------------------------
+
+model ArrivalVerification {
+  id               String         @id @default(cuid())
+  serviceRequestId String         @unique
+  serviceRequest   ServiceRequest @relation(fields: [serviceRequestId], references: [id])
+  otpHash          String
+  attempts         Int            @default(0)
+  maxAttempts      Int            @default(5)
+  expiresAt        DateTime
+  verifiedAt       DateTime?
+  createdAt        DateTime       @default(now())
+
+  @@map("arrival_verifications")
+}
+
+model PaymentVerification {
+  id               String         @id @default(cuid())
+  serviceRequestId String         @unique
+  serviceRequest   ServiceRequest @relation(fields: [serviceRequestId], references: [id])
+  otpHash          String
+  attempts         Int            @default(0)
+  maxAttempts      Int            @default(5)
+  expiresAt        DateTime
+  verifiedAt       DateTime?
+  createdAt        DateTime       @default(now())
+
+  @@map("payment_verifications")
+}
+
+// -----------------------------
+// PAYMENT (idempotency-safe)
+// -----------------------------
+
+model Payment {
+  id                String        @id @default(cuid())
+  serviceRequestId  String        @unique
+  serviceRequest    ServiceRequest @relation(fields: [serviceRequestId], references: [id])
+  amount            Decimal       @db.Decimal(10, 2)
+  // Unique idempotency/transaction reference — DB-enforced to block double-charging
+  paymentReference  String        @unique
+  status            PaymentStatus @default(PENDING)
+  paidAt            DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  @@map("payments")
+}
+
+// -----------------------------
+// REVIEWS
+// -----------------------------
+
+model Review {
+  id               String           @id @default(cuid())
+  serviceRequestId String
+  serviceRequest   ServiceRequest   @relation(fields: [serviceRequestId], references: [id])
+  reviewerId       String
+  reviewer         User             @relation("ReviewAuthor", fields: [reviewerId], references: [id])
+  targetType       ReviewTargetType
+  targetId         String
+  rating           Int
+  comment          String?
+  createdAt        DateTime         @default(now())
+
+  // one review per (request, target) to prevent duplicate ratings
+  @@unique([serviceRequestId, targetType, targetId])
+  @@index([targetType, targetId])
+  @@map("reviews")
+}
+
+// -----------------------------
+// AUDIT LOG (immutable — no update/delete in application logic)
+// -----------------------------
+
+model AuditLog {
+  id               String          @id @default(cuid())
+  actorId          String
+  actor            User            @relation("AuditActor", fields: [actorId], references: [id])
+  actorRole        UserRole
+  action           String
+  targetType       String
+  targetId         String
+  oldValue         Json?
+  newValue         Json?
+  serviceRequestId String?
+  serviceRequest   ServiceRequest? @relation(fields: [serviceRequestId], references: [id])
+  createdAt        DateTime        @default(now())
+
+  @@index([actorId])
+  @@index([targetType, targetId])
+  @@map("audit_logs")
+}
